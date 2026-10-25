@@ -8,7 +8,7 @@
 
 use bevy::{
     asset::RenderAssetUsages,
-    camera::visibility::RenderLayers,
+    camera::{MsaaWriteback, visibility::RenderLayers},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
     render::{
@@ -522,6 +522,9 @@ fn on_start(
         Camera {
             order: options.splash_camera_order,
             clear_color: ClearColorConfig::Custom(bg),
+            // `Auto` copies lower cameras' output into our main texture, which suppresses
+            // the clear above and lets the game show through around the splash.
+            msaa_writeback: MsaaWriteback::Off,
             ..default()
         },
         Msaa::Sample4,
