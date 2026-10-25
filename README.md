@@ -1,5 +1,8 @@
 # Built With Bevy Splashscreen
 
+> NOTE: This is an opinionated and partially AI-assisted fork to remove the `bevy_vello` dependency from the original code.
+> All credit goes to the original author.
+
 Provides an animated & customizable "Built with Bevy" splashscreen so you can show off your love for the engine in your own game!
 
 ![Built with Bevy splashscreen](https://raw.githubusercontent.com/Aceeri/built_with_bevy/main/assets/splash.gif)

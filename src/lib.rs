@@ -5,31 +5,37 @@
 //! - `commands.trigger(StartBevySplashscreen)` to play the splash.
 //! - `commands.trigger(SkipBevySplashscreen)` to end it early.
 //! - `app.add_observer(|_: On<BevySplashscreenEnded>| { })` to react to end.
-//!
-//! The plugin adds [`VelloPlugin`] with default settings if you haven't already
-//! added it yourself.
 
 use bevy::{
+    asset::RenderAssetUsages,
+    camera::visibility::RenderLayers,
+    mesh::{Indices, PrimitiveTopology},
     prelude::*,
     render::{
         ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
         extract_component::{ExtractComponent, ExtractComponentPlugin},
         render_resource::PipelineCache,
-        view::{ExtractedWindows, ViewTarget},
+        view::{ExtractedWindow, ViewTarget},
     },
 };
-use bevy_vello::{VelloPlugin, integrations::svg::load_svg_from_str, prelude::*};
+use lyon_tessellation::{
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator,
+    StrokeVertex, VertexBuffers, math::point, path::Path as LyonPath,
+};
 
 const BIRD_SVG: &str = include_str!("../assets/bird-0.svg");
 const BUILT_SVG: &str = include_str!("../assets/built.svg");
 const WITH_SVG: &str = include_str!("../assets/with.svg");
 const BEVY_TEXT_SVG: &str = include_str!("../assets/bevy_text.svg");
 
-const BIRD_SOURCE_FILL: &str = "#ececec"; // EKEKEKEKEK, I think a cat got in here
-const BIRD_SOURCE_BG_FILL: &str = "#232326";
-const BEVY_TEXT_SOURCE_FILL: &str = "#ececec";
-const BUILT_TEXT_SOURCE_FILL: &str = "#78787f";
-const WITH_TEXT_SOURCE_FILL: &str = "#78787f";
+const BIRD_SOURCE_FILL: [u8; 3] = [0xec, 0xec, 0xec]; // EKEKEKEKEK, I think a cat got in here
+const BIRD_SOURCE_BG_FILL: [u8; 3] = [0x23, 0x23, 0x26];
+const BEVY_TEXT_SOURCE_FILL: [u8; 3] = [0xec, 0xec, 0xec];
+const BUILT_TEXT_SOURCE_FILL: [u8; 3] = [0x78, 0x78, 0x7f];
+const WITH_TEXT_SOURCE_FILL: [u8; 3] = [0x78, 0x78, 0x7f];
+
+// Max distance (in svg pixels) between a curve and its tessellated approximation.
+const TESSELLATION_TOLERANCE: f32 = 0.01;
 const BIRD_NAMES: [&str; 3] = ["Birb 0 (front)", "Birb 1 (middle)", "Birb 2 (back)"];
 
 const BIRD_SLIDE_OFFSET: f32 = 20.0;
@@ -47,6 +53,10 @@ pub struct BevySplashscreenOptions {
     ///
     /// Defaults to 9999.
     pub splash_camera_order: isize,
+    /// Render layer used by the splash camera and its meshes.
+    ///
+    /// Defaults to 31.
+    pub splash_render_layer: usize,
     /// Colors of the bevy birbs, front to back.
     ///
     /// Defaults to:
@@ -89,6 +99,7 @@ impl Default for BevySplashscreenOptions {
         Self {
             background_color: Color::srgb_u8(0x23, 0x23, 0x26),
             splash_camera_order: 9999,
+            splash_render_layer: 31,
             bird_colors: [
                 Color::srgb_u8(0xec, 0xec, 0xec),
                 Color::srgb_u8(0xb2, 0xb2, 0xb2),
@@ -108,8 +119,6 @@ impl Default for BevySplashscreenOptions {
 
 /// Add to your project to set up the splashscreen.
 ///
-/// This adds [`VelloPlugin`] if it is not already added.
-///
 /// `commands.trigger(StartBevySplashscreen)` to play the splash.
 /// `commands.trigger(SkipBevySplashscreen)` to end it early.
 /// `app.add_observer(|_: On<BevySplashscreenEnded>| { })` to react to end.
@@ -118,10 +127,6 @@ pub struct BevySplashscreenPlugin;
 
 impl Plugin for BevySplashscreenPlugin {
     fn build(&self, app: &mut App) {
-        if !app.is_plugin_added::<VelloPlugin>() {
-            app.add_plugins(VelloPlugin::default());
-        }
-
         app.init_resource::<BevySplashscreenOptions>()
             .init_resource::<RenderReadiness>()
             .add_plugins(ExtractComponentPlugin::<SplashCamera>::default())
@@ -132,7 +137,10 @@ impl Plugin for BevySplashscreenPlugin {
             .add_observer(on_skip)
             .add_observer(on_trigger_fade)
             .add_observer(on_trigger_keyframe)
-            .add_systems(Update, (splash_dispatch, elapsed, fade, keyframe).chain());
+            .add_systems(
+                Update,
+                (splash_dispatch, elapsed, fade, keyframe, apply_shape_alpha).chain(),
+            );
 
         match app.get_sub_app_mut(RenderApp) {
             Some(render_app) => {
@@ -152,6 +160,7 @@ impl Plugin for BevySplashscreenPlugin {
 }
 
 #[derive(Component, Clone, ExtractComponent)]
+#[extract_app(RenderApp)]
 struct SplashCamera;
 
 #[derive(Resource, Clone, Copy, Default, Debug)]
@@ -180,15 +189,12 @@ impl RenderReadiness {
 
 fn record_render_readiness(
     mut readiness: ResMut<RenderReadiness>,
-    windows: Res<ExtractedWindows>,
+    windows: Query<&ExtractedWindow>,
     pipeline_cache: Res<PipelineCache>,
     splash_views: Query<(), (With<SplashCamera>, With<ViewTarget>)>,
 ) {
     *readiness = RenderReadiness {
-        window_presented: windows
-            .windows
-            .values()
-            .any(|window| !window.needs_initial_present),
+        window_presented: windows.iter().any(|window| !window.needs_initial_present),
         pipelines_idle: pipeline_cache.waiting_pipelines().next().is_none(),
         camera_rendered: !splash_views.is_empty(),
     };
@@ -276,23 +282,223 @@ struct Splash {
     waited: f32,
 }
 
-fn color_to_hex(color: Color) -> String {
-    let c = color.to_srgba();
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        (c.red * 255.0).round() as u8,
-        (c.green * 255.0).round() as u8,
-        (c.blue * 255.0).round() as u8
-    )
+/// How a [`Shape`]'s alpha is applied to its parts.
+#[derive(Clone, Copy)]
+enum ShapeBlend {
+    /// Mix each part's color in from the background color.
+    Background,
+    /// Plain alpha blending, for single-part shapes drawn over other content.
+    Alpha,
 }
 
-fn bake_svg_fill(svg: &str, fills: &[(&str, Color)]) -> VelloSvg {
-    let mut recolored = svg.to_owned();
-    for (placeholder, fill) in fills {
-        recolored = recolored.replace(placeholder, &color_to_hex(*fill));
-    }
+/// A group of [`ShapePart`] children faded together.
+#[derive(Component)]
+struct Shape {
+    alpha: f32,
+    blend: ShapeBlend,
+}
 
-    load_svg_from_str(&recolored).expect("bundled svg failed to parse")
+impl Shape {
+    fn part_color(&self, color: Color, background: Color) -> Color {
+        match self.blend {
+            // Mixed in linear space to match how the GPU alpha blends `ShapeBlend::Alpha`.
+            ShapeBlend::Background => LinearRgba::from(background)
+                .mix(&color.into(), self.alpha)
+                .into(),
+            ShapeBlend::Alpha => color.with_alpha(self.alpha),
+        }
+    }
+}
+
+/// One colored, tessellated piece of a [`Shape`].
+#[derive(Component)]
+struct ShapePart {
+    color: Color,
+}
+
+/// Tessellates every filled/stroked path of an svg into meshes.
+fn tessellate_svg(svg: &str, recolor: &[([u8; 3], Color)]) -> Vec<(Mesh, Color)> {
+    let tree =
+        usvg::Tree::from_str(svg, &usvg::Options::default()).expect("bundled svg failed to parse");
+    let half = Vec2::new(tree.size().width(), tree.size().height()) / 2.0;
+
+    let mut parts = Vec::new();
+    collect_parts(tree.root(), half, recolor, &mut parts);
+    parts
+}
+
+fn collect_parts(
+    group: &usvg::Group,
+    half: Vec2,
+    recolor: &[([u8; 3], Color)],
+    parts: &mut Vec<(Mesh, Color)>,
+) {
+    for node in group.children() {
+        match node {
+            usvg::Node::Group(group) => collect_parts(group, half, recolor, parts),
+            usvg::Node::Path(path) if path.is_visible() => {
+                let ts = path.abs_transform();
+                let lyon_path = to_lyon_path(path.data(), ts, half);
+                let fill = path.fill().map(|fill| {
+                    let rule = match fill.rule() {
+                        usvg::FillRule::NonZero => lyon_tessellation::FillRule::NonZero,
+                        usvg::FillRule::EvenOdd => lyon_tessellation::FillRule::EvenOdd,
+                    };
+                    (
+                        fill_mesh(&lyon_path, rule),
+                        paint_color(fill.paint(), recolor),
+                    )
+                });
+                let stroke = path.stroke().map(|stroke| {
+                    let scale = (ts.sx * ts.sy - ts.kx * ts.ky).abs().sqrt();
+                    (
+                        stroke_mesh(&lyon_path, stroke, scale),
+                        paint_color(stroke.paint(), recolor),
+                    )
+                });
+
+                match path.paint_order() {
+                    usvg::PaintOrder::FillAndStroke => parts.extend(fill.into_iter().chain(stroke)),
+                    usvg::PaintOrder::StrokeAndFill => parts.extend(stroke.into_iter().chain(fill)),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn paint_color(paint: &usvg::Paint, recolor: &[([u8; 3], Color)]) -> Color {
+    let usvg::Paint::Color(c) = paint else {
+        panic!("bundled svgs only use solid colors");
+    };
+    let rgb = [c.red, c.green, c.blue];
+    recolor
+        .iter()
+        .find(|(source, _)| *source == rgb)
+        .map_or(Color::srgb_u8(c.red, c.green, c.blue), |(_, color)| *color)
+}
+
+fn to_lyon_path(data: &usvg::tiny_skia_path::Path, ts: usvg::Transform, half: Vec2) -> LyonPath {
+    use usvg::tiny_skia_path::PathSegment;
+
+    let map = |p: usvg::tiny_skia_path::Point| {
+        let x = ts.sx * p.x + ts.kx * p.y + ts.tx;
+        let y = ts.ky * p.x + ts.sy * p.y + ts.ty;
+        point(x - half.x, half.y - y)
+    };
+
+    let mut builder = LyonPath::builder();
+    let mut open = false;
+    for segment in data.segments() {
+        match segment {
+            PathSegment::MoveTo(p) => {
+                if open {
+                    builder.end(false);
+                }
+                builder.begin(map(p));
+                open = true;
+            }
+            PathSegment::LineTo(p) => {
+                builder.line_to(map(p));
+            }
+            PathSegment::QuadTo(c, p) => {
+                builder.quadratic_bezier_to(map(c), map(p));
+            }
+            PathSegment::CubicTo(c1, c2, p) => {
+                builder.cubic_bezier_to(map(c1), map(c2), map(p));
+            }
+            PathSegment::Close => {
+                builder.end(true);
+                open = false;
+            }
+        }
+    }
+    if open {
+        builder.end(false);
+    }
+    builder.build()
+}
+
+fn fill_mesh(path: &LyonPath, rule: lyon_tessellation::FillRule) -> Mesh {
+    let mut buffers: VertexBuffers<[f32; 3], u32> = VertexBuffers::new();
+    FillTessellator::new()
+        .tessellate_path(
+            path,
+            &FillOptions::tolerance(TESSELLATION_TOLERANCE).with_fill_rule(rule),
+            &mut BuffersBuilder::new(&mut buffers, |v: FillVertex| {
+                [v.position().x, v.position().y, 0.0]
+            }),
+        )
+        .expect("bundled svg failed to tessellate");
+    to_mesh(buffers)
+}
+
+fn stroke_mesh(path: &LyonPath, stroke: &usvg::Stroke, scale: f32) -> Mesh {
+    let options = StrokeOptions::tolerance(TESSELLATION_TOLERANCE)
+        .with_line_width(stroke.width().get() * scale)
+        .with_miter_limit(stroke.miterlimit().get())
+        .with_line_cap(match stroke.linecap() {
+            usvg::LineCap::Butt => lyon_tessellation::LineCap::Butt,
+            usvg::LineCap::Round => lyon_tessellation::LineCap::Round,
+            usvg::LineCap::Square => lyon_tessellation::LineCap::Square,
+        })
+        .with_line_join(match stroke.linejoin() {
+            usvg::LineJoin::Miter => lyon_tessellation::LineJoin::Miter,
+            usvg::LineJoin::MiterClip => lyon_tessellation::LineJoin::MiterClip,
+            usvg::LineJoin::Round => lyon_tessellation::LineJoin::Round,
+            usvg::LineJoin::Bevel => lyon_tessellation::LineJoin::Bevel,
+        });
+
+    let mut buffers: VertexBuffers<[f32; 3], u32> = VertexBuffers::new();
+    StrokeTessellator::new()
+        .tessellate_path(
+            path,
+            &options,
+            &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex| {
+                [v.position().x, v.position().y, 0.0]
+            }),
+        )
+        .expect("bundled svg failed to tessellate");
+    to_mesh(buffers)
+}
+
+fn to_mesh(buffers: VertexBuffers<[f32; 3], u32>) -> Mesh {
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, buffers.vertices)
+    .with_inserted_indices(Indices::U32(buffers.indices))
+}
+
+/// Spawns a [`Shape`] with one mesh child per part.
+fn spawn_shape(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    options: &BevySplashscreenOptions,
+    parts: Vec<(Mesh, Color)>,
+    shape: Shape,
+    bundle: impl Bundle,
+) -> Entity {
+    let initial: Vec<Color> = parts
+        .iter()
+        .map(|(_, color)| shape.part_color(*color, options.background_color))
+        .collect();
+    commands
+        .spawn((shape, bundle, Visibility::default()))
+        .with_children(|parent| {
+            for (index, (mesh, color)) in parts.into_iter().enumerate() {
+                parent.spawn((
+                    Mesh2d(meshes.add(mesh)),
+                    MeshMaterial2d(materials.add(initial[index])),
+                    Transform::from_xyz(0.0, 0.0, index as f32 * 0.001),
+                    ShapePart { color },
+                    RenderLayers::layer(options.splash_render_layer),
+                ));
+            }
+        })
+        .id()
 }
 
 fn on_start(
@@ -300,13 +506,14 @@ fn on_start(
     existing: Option<Res<Splash>>,
     options: Res<BevySplashscreenOptions>,
     mut commands: Commands,
-    mut svgs: ResMut<Assets<VelloSvg>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     if existing.is_some() {
         return;
     }
 
-    let bg_hex = color_to_hex(options.background_color);
+    let bg = options.background_color;
 
     commands.spawn((
         Name::new("Splash camera"),
@@ -314,147 +521,156 @@ fn on_start(
         Camera2d,
         Camera {
             order: options.splash_camera_order,
-            clear_color: ClearColorConfig::Custom(options.background_color),
+            clear_color: ClearColorConfig::Custom(bg),
             ..default()
         },
-        VelloView,
         Msaa::Sample4,
+        RenderLayers::layer(options.splash_render_layer),
         SplashEntity,
     ));
 
-    let built = commands
-        .spawn((
+    // Everything is spawned visible but fully faded out.
+    // This hypothetically ensures render pipelines are compiled *before* 
+    // the meshes show up instead of during when they show up.
+    let hidden = |blend| Shape { alpha: 0.0, blend };
+
+    let built = spawn_shape(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &options,
+        tessellate_svg(
+            BUILT_SVG,
+            &[(BUILT_TEXT_SOURCE_FILL, options.built_text_color)],
+        ),
+        hidden(ShapeBlend::Background),
+        (
             Name::new("'Built' text"),
-            VelloSvg2d(svgs.add(bake_svg_fill(
-                BUILT_SVG,
-                &[(BUILT_TEXT_SOURCE_FILL, options.built_text_color)],
-            ))),
-            VelloSvgAnchor::Center,
             Transform::from_xyz(55.0, 60.0, 0.0),
-            Visibility::Hidden,
             Fade::default(),
             SplashEntity,
-        ))
-        .id();
-
-    let with = commands
-        .spawn((
-            Name::new("'With' text"),
-            VelloSvg2d(svgs.add(bake_svg_fill(
-                WITH_SVG,
-                &[(WITH_TEXT_SOURCE_FILL, options.with_text_color)],
-            ))),
-            VelloSvgAnchor::Center,
-            Transform::from_xyz(180.0, 60.0, 0.0),
-            Visibility::Hidden,
-            Fade::default(),
-            SplashEntity,
-        ))
-        .id();
-
-    let bevy = commands
-        .spawn((
-            Name::new("Bevy text"),
-            VelloSvg2d(svgs.add(bake_svg_fill(
-                BEVY_TEXT_SVG,
-                &[(BEVY_TEXT_SOURCE_FILL, options.bevy_text_color)],
-            ))),
-            VelloSvgAnchor::Center,
-            Transform::from_xyz(90.0, -20.0, 0.0),
-            Visibility::Hidden,
-            Fade::default(),
-            SplashEntity,
-        ))
-        .id();
-
-    let bodies: [Handle<VelloSvg>; 3] = std::array::from_fn(|i| {
-        svgs.add(bake_svg_fill(
-            BIRD_SVG,
-            &[
-                (BIRD_SOURCE_FILL, options.bird_colors[i]),
-                (BIRD_SOURCE_BG_FILL, options.background_color),
-            ],
-        ))
-    });
-
-    let cutoff_svg = svgs.add(
-        load_svg_from_str(&format!(
-            r#"<svg><rect width="1" height="1" fill="{bg_hex}"/></svg>"#
-        ))
-        .expect("cutoff svg failed to parse"),
+        ),
     );
+
+    let with = spawn_shape(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &options,
+        tessellate_svg(
+            WITH_SVG,
+            &[(WITH_TEXT_SOURCE_FILL, options.with_text_color)],
+        ),
+        hidden(ShapeBlend::Background),
+        (
+            Name::new("'With' text"),
+            Transform::from_xyz(180.0, 60.0, 0.0),
+            Fade::default(),
+            SplashEntity,
+        ),
+    );
+
+    let bevy = spawn_shape(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &options,
+        tessellate_svg(
+            BEVY_TEXT_SVG,
+            &[(BEVY_TEXT_SOURCE_FILL, options.bevy_text_color)],
+        ),
+        hidden(ShapeBlend::Background),
+        (
+            Name::new("Bevy text"),
+            Transform::from_xyz(90.0, -20.0, 0.0),
+            Fade::default(),
+            SplashEntity,
+        ),
+    );
+
+    let unit_square = || vec![(Rectangle::new(1.0, 1.0).into(), bg)];
 
     let cutoff_rotation = Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, -0.3);
     let cutoff_scale = Vec3::new(50.0, 100.0, 1.0);
     let cutoff_keyframe = KeyFrame {
         start: Transform {
-            translation: Vec3::new(-13.0, 5.8, 0.0),
+            // Slightly behind the front bird (its parent) but in front of the others.
+            translation: Vec3::new(-13.0, 5.8, -0.1),
             rotation: cutoff_rotation,
             scale: cutoff_scale,
         },
         end: Transform {
-            translation: Vec3::new(-13.0, 5.8, 0.0),
+            translation: Vec3::new(-13.0, 5.8, -0.1),
             rotation: cutoff_rotation,
             scale: cutoff_scale,
         },
     };
 
-    let cutoff = commands
-        .spawn((
+    let cutoff = spawn_shape(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &options,
+        unit_square(),
+        hidden(ShapeBlend::Background),
+        (
             Name::new("Tail/wing cutoff"),
-            VelloSvg2d(cutoff_svg),
-            VelloSvgAnchor::Center,
             cutoff_keyframe.start,
-            Visibility::Hidden,
             KeyframeInterp::from_keyframe(cutoff_keyframe),
-        ))
-        .id();
-
-    let overlay_svg = svgs.add(
-        load_svg_from_str(&format!(
-            r#"<svg><rect width="1" height="1" fill="{bg_hex}"/></svg>"#
-        ))
-        .expect("overlay svg failed to parse"),
+        ),
     );
 
-    let overlay = commands
-        .spawn((
+    let overlay = spawn_shape(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &options,
+        unit_square(),
+        hidden(ShapeBlend::Alpha),
+        (
             Name::new("Fade-out overlay"),
-            VelloSvg2d(overlay_svg),
-            VelloSvgAnchor::Center,
             Transform::from_xyz(0.0, 0.0, 100.0).with_scale(Vec3::new(3000.0, 3000.0, 1.0)),
-            Visibility::Hidden,
             Fade::default(),
             SplashEntity,
-        ))
-        .id();
+        ),
+    );
 
     let mut birds = [Entity::PLACEHOLDER; 3];
     let keyframes = bird_keyframes();
-    for index in 0u8..3 {
-        let keyframe = keyframes[index as usize].clone();
+    for index in 0..3 {
+        let keyframe = keyframes[index].clone();
 
-        let mut bird_cmds = commands.spawn((
-            Name::new(BIRD_NAMES[index as usize]),
-            VelloSvg2d(bodies[index as usize].clone()),
-            VelloSvgAnchor::Center,
-            keyframe.start,
-            Visibility::Hidden,
-            KeyframeInterp {
-                start: false,
-                elapsed: 0.0,
-                keyframe,
+        birds[index] = spawn_shape(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &options,
+            tessellate_svg(
+                BIRD_SVG,
+                &[
+                    (BIRD_SOURCE_FILL, options.bird_colors[index]),
+                    (BIRD_SOURCE_BG_FILL, bg),
+                ],
+            ),
+            hidden(ShapeBlend::Background),
+            (
+                Name::new(BIRD_NAMES[index]),
+                keyframe.start,
+                KeyframeInterp {
+                    start: false,
+                    elapsed: 0.0,
+                    keyframe,
 
-                translation: EaseFunction::BackInOut,
-                rotation: EaseFunction::BackInOut,
-                scale: EaseFunction::BackInOut,
-            },
-            SplashEntity,
-        ));
+                    translation: EaseFunction::BackInOut,
+                    rotation: EaseFunction::BackInOut,
+                    scale: EaseFunction::BackInOut,
+                },
+                SplashEntity,
+            ),
+        );
         if index == 0 {
-            bird_cmds.insert(Fade::default());
+            commands.entity(birds[index]).insert(Fade::default());
         }
-        birds[index as usize] = bird_cmds.id();
     }
 
     commands.entity(cutoff).insert(ChildOf(birds[0]));
@@ -506,13 +722,12 @@ struct TriggerFade {
     entity: Entity,
 }
 
-fn on_trigger_fade(on: On<TriggerFade>, mut q: Query<(&mut Fade, &mut Visibility)>) {
-    let Ok((mut fade, mut visibility)) = q.get_mut(on.entity) else {
+fn on_trigger_fade(on: On<TriggerFade>, mut fades: Query<&mut Fade>) {
+    let Ok(mut fade) = fades.get_mut(on.entity) else {
         return;
     };
     fade.start = true;
     fade.elapsed = 0.0;
-    *visibility = Visibility::Visible;
 }
 
 #[derive(EntityEvent)]
@@ -586,6 +801,7 @@ fn elapsed(time: Res<Time>, mut fade: Query<&mut Fade>, mut key: Query<&mut Keyf
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn splash_dispatch(
     time: Res<Time>,
     real: Res<Time<Real>>,
@@ -594,6 +810,7 @@ fn splash_dispatch(
     splash: Option<ResMut<Splash>>,
     splash_entities: Query<Entity, With<SplashEntity>>,
     fades: Query<&Fade>,
+    mut shapes: Query<&mut Shape>,
     mut commands: Commands,
 ) {
     let Some(mut splash) = splash else {
@@ -642,7 +859,9 @@ fn splash_dispatch(
                 Step::Fade(entity) => commands.trigger(TriggerFade { entity }),
                 Step::Keyframe(entity) => commands.trigger(TriggerKeyFrame { entity }),
                 Step::Show(entity) => {
-                    commands.entity(entity).insert(Visibility::Visible);
+                    if let Ok(mut shape) = shapes.get_mut(entity) {
+                        shape.alpha = 1.0;
+                    }
                 }
             }
         }
@@ -656,20 +875,29 @@ fn splash_dispatch(
     }
 }
 
-fn fade(
-    fades: Query<(&Fade, &VelloSvg2d)>,
-    mut svgs: ResMut<Assets<VelloSvg>>,
-    options: Res<BevySplashscreenOptions>,
-) {
-    for (fade, vello) in &fades {
+fn fade(mut fades: Query<(&Fade, &mut Shape)>, options: Res<BevySplashscreenOptions>) {
+    for (fade, mut shape) in &mut fades {
         if !fade.start {
             continue;
         }
 
         let t = (fade.elapsed / options.fade_duration).clamp(0.0, 1.0);
-        let alpha = fade.from + (fade.to - fade.from) * t;
-        if let Some(mut svg) = svgs.get_mut(&vello.0) {
-            svg.alpha = alpha;
+        shape.alpha = fade.from + (fade.to - fade.from) * t;
+    }
+}
+
+fn apply_shape_alpha(
+    shapes: Query<(&Shape, &Children), Changed<Shape>>,
+    parts: Query<(&ShapePart, &MeshMaterial2d<ColorMaterial>)>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    options: Res<BevySplashscreenOptions>,
+) {
+    for (shape, children) in &shapes {
+        for (part, material) in parts.iter_many(children).flatten() {
+            let Some(mut material) = materials.get_mut(&material.0) else {
+                continue;
+            };
+            material.color = shape.part_color(part.color, options.background_color);
         }
     }
 }
